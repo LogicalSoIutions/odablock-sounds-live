@@ -282,7 +282,10 @@ async function main() {
   }
 
   async function publishNotification(message) {
-    const payload = { message };
+    const payload = { 
+      message, 
+      time: new Date().toISOString() 
+    };
 
     try {
       const result = await github.publishFile(
