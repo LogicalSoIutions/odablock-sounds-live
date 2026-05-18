@@ -73,12 +73,24 @@ async function fetchPublishedState(config) {
 async function publishStatus(config, status, currentSha) {
   validateConfig(config);
 
-  const url = buildContentsUrl(config);
-  const fileContent = `${JSON.stringify(status, null, 2)}\n`;
-  const base64Content = Buffer.from(fileContent, "utf8").toString("base64");
   const commitMessage = status.live
     ? `Update livestream.json: live - ${status.title ?? ""}`.trim()
     : "Update livestream.json: offline";
+
+  return publishFile(config, config.filePath, status, commitMessage, currentSha);
+}
+
+async function publishFile(config, filePath, data, commitMessage, currentSha) {
+  validateConfig(config);
+
+  const encodedPath = filePath
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `${GITHUB_API_BASE}/repos/${config.owner}/${config.repo}/contents/${encodedPath}`;
+
+  const fileContent = `${JSON.stringify(data, null, 2)}\n`;
+  const base64Content = Buffer.from(fileContent, "utf8").toString("base64");
 
   const body = {
     message: commitMessage,
@@ -117,4 +129,5 @@ async function publishStatus(config, status, currentSha) {
 module.exports = {
   fetchPublishedState,
   publishStatus,
+  publishFile,
 };

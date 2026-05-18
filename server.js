@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 
 const github = require("./github");
+const kickWebhook = require("./kick-webhook");
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -149,7 +150,6 @@ async function fetchKickAppAccessToken(config, tokenCache) {
     throw new Error("Kick OAuth response missing access_token or expires_in.");
   }
 
-  // Refresh slightly before expiry to avoid using a near-expired token.
   const safetyWindowMs = 30 * 1000;
   tokenCache.accessToken = accessToken;
   tokenCache.expiresAtMs = Date.now() + expiresInSec * 1000 - safetyWindowMs;
@@ -202,6 +202,9 @@ function buildConfig() {
     kickClientSecret: process.env.KICK_CLIENT_SECRET || "",
     forceOffline: String(process.env.FORCE_OFFLINE || "").toLowerCase() === "true",
     pollIntervalMs: Number(process.env.KICK_POLL_INTERVAL_MS || 10 * 60 * 1000),
+    webhookPort: Number(process.env.WEBHOOK_PORT),
+    webhookDomain: process.env.WEBHOOK_DOMAIN,
+    broadcasterUserId: process.env.KICK_BROADCASTER_USER_ID ? Number(process.env.KICK_BROADCASTER_USER_ID) : null,
     github: {
       token: process.env.GITHUB_TOKEN || "",
       owner: process.env.GITHUB_OWNER || "",
@@ -242,6 +245,82 @@ async function main() {
     requestInFlight: null,
   };
 
+
+  const ANNOUNCE_CMD = "!AnnounceRL";
+  let notificationSha = null;
+
+  try {
+    const notifConfig = { ...config.github, filePath: "custom_notifications.json" };
+    const existing = await github.fetchPublishedState(notifConfig);
+    notificationSha = existing.sha;
+    if (existing.exists) {
+      console.log("[notify] Loaded existing custom_notifications.json SHA");
+    }
+  } catch (error) {
+    console.warn(`[notify] Could not load custom_notifications.json: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  function handleChatMessage(event) {
+    const sender = event.sender?.username ?? "unknown";
+    if (sender.toLowerCase() !== config.channelSlug.toLowerCase()) return;
+
+    const content = event.content ?? "";
+    const time = event.created_at
+      ? new Date(event.created_at).toLocaleTimeString("en-US", { hour12: false })
+      : new Date().toLocaleTimeString("en-US", { hour12: false });
+
+    console.log(`[chat] ${sender} | ${content} | ${time}`);
+
+    if (content.toLowerCase().startsWith(ANNOUNCE_CMD.toLowerCase())) {
+      const message = content.slice(ANNOUNCE_CMD.length).trim();
+      if (!message) {
+        console.log("[notify] !AnnounceRL used with no message, ignoring.");
+        return;
+      }
+      publishNotification(message);
+    }
+  }
+
+  async function publishNotification(message) {
+    const payload = { message };
+
+    try {
+      const result = await github.publishFile(
+        config.github,
+        "custom_notifications.json",
+        payload,
+        `Update notification: ${message.slice(0, 50)}`,
+        notificationSha
+      );
+      notificationSha = result.sha;
+      console.log(`[notify] Published: "${message}"`);
+    } catch (error) {
+      console.error(`[notify] Failed to publish: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  kickWebhook.createWebhookServer(config, handleChatMessage);
+
+  try {
+    let broadcasterUserId = config.broadcasterUserId;
+    if (!broadcasterUserId) {
+      broadcasterUserId = await kickWebhook.resolveBroadcasterUserId(config, tokenState, getValidAccessToken);
+      console.log(`[webhook] Resolved broadcaster user ID: ${broadcasterUserId}`);
+    }
+
+    const existing = await kickWebhook.listEventSubscriptions(config, tokenState, getValidAccessToken, broadcasterUserId);
+    const hasChatSub = existing.some((sub) => sub.event === "chat.message.sent");
+    if (hasChatSub) {
+      console.log("[webhook] Already subscribed to chat.message.sent, skipping.");
+    } else {
+      await kickWebhook.subscribeToChatMessages(config, tokenState, getValidAccessToken, broadcasterUserId);
+    }
+  } catch (error) {
+    console.error(
+      `[webhook] Chat subscription setup failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+    console.error("[webhook] The webhook server is still running — you can subscribe manually later.");
+  }
 
   const baseline = await loadBaselineFromGithub(config);
   let lastPublished = baseline.lastPublished;
