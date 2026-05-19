@@ -4,7 +4,8 @@ This repository contains a Node.js service that monitors a Kick.com stream statu
 
 ## Features
 
-*   **Livestream Status Polling:** Regularly checks a specified Kick channel (e.g., `odablock`) to see if they are live and updates `livestream.json` with the current status and stream title.
+*   **Livestream Status Webhooks:** Subscribes to Kick `livestream.status.updated` and `livestream.metadata.updated` events for near-real-time updates to `livestream.json`.
+*   **Backup Polling:** Polls the Kick API every 5 minutes (configurable) as a fallback if a webhook is missed.
 *   **Chat Command Webhook:** Listens via Kick Webhooks for chat messages. If the broadcaster types a command like `!AnnounceRL <message>`, it automatically publishes that message to `custom_notifications.json`.
 *   **GitHub Integration:** Uses the GitHub API to commit changes directly to the repository, providing a serverless "database" for frontends.
 
@@ -38,6 +39,7 @@ npm start
 ```
 
 Once running, the service will:
-1. Start polling the Kick API based on the `KICK_POLL_INTERVAL_MS` to update `livestream.json`.
-2. Start an Express webhook server on `WEBHOOK_PORT`.
-3. Automatically subscribe to the `chat.message.sent` Kick event (if not already subscribed) and listen for the `!AnnounceRL` command in chat to update `custom_notifications.json`.
+1. Start an Express webhook server on `WEBHOOK_PORT`.
+2. Automatically subscribe to Kick events (`livestream.status.updated`, `livestream.metadata.updated`, `chat.message.sent`) if not already subscribed.
+3. Update `livestream.json` from livestream webhooks, with backup polling every `KICK_POLL_INTERVAL_MS` (default 5 minutes).
+4. Listen for the `!AnnounceRL` command in chat to update `custom_notifications.json`.

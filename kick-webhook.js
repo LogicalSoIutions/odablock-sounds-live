@@ -72,11 +72,16 @@ async function resolveBroadcasterUserId(config, tokenState, getValidAccessToken)
   return userId;
 }
 
-async function subscribeToChatMessages(config, tokenState, getValidAccessToken, broadcasterUserId) {
+const LIVESTREAM_STATUS_EVENT = "livestream.status.updated";
+const LIVESTREAM_METADATA_EVENT = "livestream.metadata.updated";
+
+async function subscribeToEvents(config, tokenState, getValidAccessToken, broadcasterUserId, eventNames) {
+  if (!eventNames.length) return null;
+
   const accessToken = await getValidAccessToken(config, tokenState);
 
   const body = {
-    events: [{ name: "chat.message.sent", version: 1 }],
+    events: eventNames.map((name) => ({ name, version: 1 })),
     broadcaster_user_id: broadcasterUserId,
     method: "webhook",
   };
@@ -93,11 +98,14 @@ async function subscribeToChatMessages(config, tokenState, getValidAccessToken, 
 
   if (!response.ok) {
     const errorBody = await response.text();
-    throw new Error(`Failed to subscribe to chat events (${response.status}): ${errorBody}`);
+    throw new Error(`Failed to subscribe to Kick events (${response.status}): ${errorBody}`);
   }
 
   const payload = await response.json();
-  console.log("[webhook] Subscribed to chat.message.sent events:", JSON.stringify(payload?.data ?? [], null, 2));
+  console.log(
+    `[webhook] Subscribed to events: ${eventNames.join(", ")}`,
+    JSON.stringify(payload?.data ?? [], null, 2)
+  );
   return payload;
 }
 
@@ -122,7 +130,8 @@ async function listEventSubscriptions(config, tokenState, getValidAccessToken, b
   return payload?.data ?? [];
 }
 
-function createWebhookServer(config, onChatMessage) {
+function createWebhookServer(config, handlers) {
+  const { onChatMessage, onLivestreamEvent } = handlers;
   const app = express();
 
   app.post("/kick/webhook", express.raw({ type: "application/json" }), async (req, res) => {
@@ -164,6 +173,19 @@ function createWebhookServer(config, onChatMessage) {
       } catch (error) {
         console.error(`[webhook] Chat message handler error: ${error instanceof Error ? error.message : String(error)}`);
       }
+    } else if (
+      eventType === LIVESTREAM_STATUS_EVENT ||
+      eventType === LIVESTREAM_METADATA_EVENT
+    ) {
+      if (onLivestreamEvent) {
+        try {
+          onLivestreamEvent(eventType, eventPayload);
+        } catch (error) {
+          console.error(
+            `[webhook] Livestream handler error: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
     } else {
       console.log(`[webhook] Received event: ${eventType} (v${eventVersion}) [${messageId}]`);
     }
@@ -180,8 +202,10 @@ function createWebhookServer(config, onChatMessage) {
 
 module.exports = {
   createWebhookServer,
-  subscribeToChatMessages,
+  subscribeToEvents,
   listEventSubscriptions,
   resolveBroadcasterUserId,
   verifyWebhookSignature,
+  LIVESTREAM_STATUS_EVENT,
+  LIVESTREAM_METADATA_EVENT,
 };

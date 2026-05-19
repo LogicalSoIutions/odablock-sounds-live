@@ -84,10 +84,7 @@ function formatTitleForJson(title) {
   return title.replace(/\|/g, "-");
 }
 
-function parseStreamWentLiveAt(stream) {
-  if (!stream?.is_live) return null;
-
-  const raw = stream.start_time;
+function parseWentLiveAt(raw) {
   if (typeof raw !== "string" || !raw.trim()) return null;
 
   const date = new Date(raw);
@@ -96,6 +93,30 @@ function parseStreamWentLiveAt(stream) {
   }
 
   return date.toISOString();
+}
+
+function parseStreamWentLiveAt(stream) {
+  if (!stream?.is_live) return null;
+  return parseWentLiveAt(stream.start_time);
+}
+
+function isEventForMonitoredChannel(payload, channelSlug) {
+  const slug = payload?.broadcaster?.channel_slug;
+  if (!slug) return true;
+  return slug.toLowerCase() === channelSlug.toLowerCase();
+}
+
+function statusFromLivestreamStatusEvent(payload) {
+  const isLive = Boolean(payload?.is_live);
+  const title = isLive ? formatTitleForJson(payload?.title) : null;
+  const wentLiveAt = isLive ? parseWentLiveAt(payload?.started_at) : null;
+  return { isLive, title, wentLiveAt };
+}
+
+function statusFromLivestreamMetadataEvent(payload) {
+  const title = formatTitleForJson(payload?.metadata?.title);
+  if (!title) return null;
+  return { isLive: true, title, wentLiveAt: null };
 }
 
 function toPublishedStatus(status) {
@@ -237,7 +258,7 @@ function buildConfig() {
     kickClientId: process.env.KICK_CLIENT_ID || "",
     kickClientSecret: process.env.KICK_CLIENT_SECRET || "",
     forceOffline: String(process.env.FORCE_OFFLINE || "").toLowerCase() === "true",
-    pollIntervalMs: Number(process.env.KICK_POLL_INTERVAL_MS || 10 * 60 * 1000),
+    pollIntervalMs: Number(process.env.KICK_POLL_INTERVAL_MS || 5 * 60 * 1000),
     webhookPort: Number(process.env.WEBHOOK_PORT),
     webhookDomain: process.env.WEBHOOK_DOMAIN,
     broadcasterUserId: process.env.KICK_BROADCASTER_USER_ID ? Number(process.env.KICK_BROADCASTER_USER_ID) : null,
@@ -338,42 +359,15 @@ async function main() {
     }
   }
 
-  kickWebhook.createWebhookServer(config, handleChatMessage);
-
-  try {
-    let broadcasterUserId = config.broadcasterUserId;
-    if (!broadcasterUserId) {
-      broadcasterUserId = await kickWebhook.resolveBroadcasterUserId(config, tokenState, getValidAccessToken);
-      console.log(`[webhook] Resolved broadcaster user ID: ${broadcasterUserId}`);
-    }
-
-    const existing = await kickWebhook.listEventSubscriptions(config, tokenState, getValidAccessToken, broadcasterUserId);
-    const hasChatSub = existing.some((sub) => sub.event === "chat.message.sent");
-    if (hasChatSub) {
-      console.log("[webhook] Already subscribed to chat.message.sent, skipping.");
-    } else {
-      await kickWebhook.subscribeToChatMessages(config, tokenState, getValidAccessToken, broadcasterUserId);
-    }
-  } catch (error) {
-    console.error(
-      `[webhook] Chat subscription setup failed: ${error instanceof Error ? error.message : String(error)}`
-    );
-    console.error("[webhook] The webhook server is still running — you can subscribe manually later.");
-  }
-
   const baseline = await loadBaselineFromGithub(config);
   let lastPublished = baseline.lastPublished;
   let currentSha = baseline.sha;
-  let pollInFlight = null;
+  let statusUpdateInFlight = null;
 
-  async function pollAndMaybePublish(trigger) {
-    if (pollInFlight) return pollInFlight;
+  async function applyStatusAndMaybePublish(trigger, nextStatus) {
+    if (statusUpdateInFlight) return statusUpdateInFlight;
 
-    pollInFlight = (async () => {
-      const nextStatus = config.forceOffline
-        ? { isLive: false, title: null }
-        : await fetchChannelStatusFromKick(config, tokenState);
-
+    statusUpdateInFlight = (async () => {
       if (!shouldPublishStatus(lastPublished, nextStatus)) {
         console.log(`[${trigger}] No livestream.json changes needed.`);
         return;
@@ -398,10 +392,92 @@ async function main() {
         console.log(`[${trigger}] livestream.json published: stream is now offline.`);
       }
     })().finally(() => {
-      pollInFlight = null;
+      statusUpdateInFlight = null;
     });
 
-    return pollInFlight;
+    return statusUpdateInFlight;
+  }
+
+  async function pollAndMaybePublish(trigger) {
+    const nextStatus = config.forceOffline
+      ? { isLive: false, title: null, wentLiveAt: null }
+      : await fetchChannelStatusFromKick(config, tokenState);
+
+    return applyStatusAndMaybePublish(trigger, nextStatus);
+  }
+
+  function handleLivestreamWebhook(eventType, payload) {
+    if (config.forceOffline) return;
+
+    if (!isEventForMonitoredChannel(payload, config.channelSlug)) {
+      console.log(`[webhook] Ignoring ${eventType} for unrelated channel.`);
+      return;
+    }
+
+    let nextStatus;
+    if (eventType === kickWebhook.LIVESTREAM_STATUS_EVENT) {
+      nextStatus = statusFromLivestreamStatusEvent(payload);
+    } else if (eventType === kickWebhook.LIVESTREAM_METADATA_EVENT) {
+      if (!lastPublished?.live) {
+        console.log("[webhook] Ignoring metadata update while stream appears offline.");
+        return;
+      }
+      nextStatus = statusFromLivestreamMetadataEvent(payload);
+      if (!nextStatus) return;
+    } else {
+      return;
+    }
+
+    applyStatusAndMaybePublish(`webhook:${eventType}`, nextStatus).catch((error) => {
+      console.error(
+        `[webhook] Failed to publish livestream status: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+  }
+
+  kickWebhook.createWebhookServer(config, {
+    onChatMessage: handleChatMessage,
+    onLivestreamEvent: handleLivestreamWebhook,
+  });
+
+  const requiredEvents = [
+    "chat.message.sent",
+    kickWebhook.LIVESTREAM_STATUS_EVENT,
+    kickWebhook.LIVESTREAM_METADATA_EVENT,
+  ];
+
+  try {
+    let broadcasterUserId = config.broadcasterUserId;
+    if (!broadcasterUserId) {
+      broadcasterUserId = await kickWebhook.resolveBroadcasterUserId(config, tokenState, getValidAccessToken);
+      console.log(`[webhook] Resolved broadcaster user ID: ${broadcasterUserId}`);
+    }
+
+    const existing = await kickWebhook.listEventSubscriptions(
+      config,
+      tokenState,
+      getValidAccessToken,
+      broadcasterUserId
+    );
+    const subscribedEvents = new Set(existing.map((sub) => sub.event));
+    const missingEvents = requiredEvents.filter((event) => !subscribedEvents.has(event));
+
+    if (missingEvents.length === 0) {
+      console.log("[webhook] Already subscribed to all required events.");
+    } else {
+      await kickWebhook.subscribeToEvents(
+        config,
+        tokenState,
+        getValidAccessToken,
+        broadcasterUserId,
+        missingEvents
+      );
+    }
+  } catch (error) {
+    console.error(
+      `[webhook] Event subscription setup failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+    console.error("[webhook] The webhook server is still running — backup polling will continue.");
   }
 
   await pollAndMaybePublish("initial").catch((error) => {
