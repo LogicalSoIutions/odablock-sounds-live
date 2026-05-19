@@ -84,9 +84,27 @@ function formatTitleForJson(title) {
   return title.replace(/\|/g, "-");
 }
 
+function parseStreamWentLiveAt(stream) {
+  if (!stream?.is_live) return null;
+
+  const raw = stream.start_time;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime()) || date.getUTCFullYear() < 2000) {
+    return null;
+  }
+
+  return date.toISOString();
+}
+
 function toPublishedStatus(status) {
   if (status.isLive) {
-    return { live: true, title: status.title ?? null };
+    const payload = { live: true, title: status.title ?? null };
+    if (status.wentLiveAt) {
+      payload.wentLiveAt = status.wentLiveAt;
+    }
+    return payload;
   }
   return { live: false };
 }
@@ -94,10 +112,14 @@ function toPublishedStatus(status) {
 function normalizePublishedStatus(input) {
   if (!input || typeof input !== "object") return null;
   if (input.live === true) {
-    return {
+    const normalized = {
       live: true,
       title: typeof input.title === "string" ? input.title : null,
     };
+    if (typeof input.wentLiveAt === "string" && input.wentLiveAt.trim()) {
+      normalized.wentLiveAt = input.wentLiveAt.trim();
+    }
+    return normalized;
   }
   if (input.live === false) {
     return { live: false };
@@ -105,12 +127,25 @@ function normalizePublishedStatus(input) {
   return null;
 }
 
+function resolveWentLiveAt(nextStatus, previousPublished) {
+  if (!nextStatus.isLive) return null;
+
+  if (nextStatus.wentLiveAt) return nextStatus.wentLiveAt;
+  if (previousPublished?.live === true && previousPublished.wentLiveAt) {
+    return previousPublished.wentLiveAt;
+  }
+
+  return new Date().toISOString();
+}
+
 function shouldPublishStatus(previousPublished, nextStatus) {
   if (!previousPublished) return true;
 
   if (nextStatus.isLive) {
     if (previousPublished.live !== true) return true;
-    return previousPublished.title !== (nextStatus.title ?? null);
+    if (previousPublished.title !== (nextStatus.title ?? null)) return true;
+    const nextWentLiveAt = resolveWentLiveAt(nextStatus, previousPublished);
+    return !previousPublished.wentLiveAt && Boolean(nextWentLiveAt);
   }
 
   return previousPublished.live === true;
@@ -191,8 +226,9 @@ async function fetchChannelStatusFromKick(config, tokenState) {
   const stream = channel?.stream ?? null;
   const isLive = Boolean(stream?.is_live);
   const title = isLive ? formatTitleForJson(getTitleFromChannel(channel)) : null;
+  const wentLiveAt = isLive ? parseStreamWentLiveAt(stream) : null;
 
-  return { isLive, title };
+  return { isLive, title, wentLiveAt };
 }
 
 function buildConfig() {
@@ -344,15 +380,19 @@ async function main() {
       }
 
       const previous = lastPublished;
-      const payload = toPublishedStatus(nextStatus);
+      const payload = toPublishedStatus({
+        ...nextStatus,
+        wentLiveAt: resolveWentLiveAt(nextStatus, previous),
+      });
       const result = await github.publishStatus(config.github, payload, currentSha);
       lastPublished = payload;
       if (result.sha) currentSha = result.sha;
 
       if (payload.live) {
         const previousTitle = previous?.live ? previous.title ?? "" : "";
+        const wentLiveSuffix = payload.wentLiveAt ? ` (went live ${payload.wentLiveAt})` : "";
         console.log(
-          `[${trigger}] livestream.json published: "${previousTitle}" -> "${payload.title ?? ""}"`
+          `[${trigger}] livestream.json published: "${previousTitle}" -> "${payload.title ?? ""}"${wentLiveSuffix}`
         );
       } else {
         console.log(`[${trigger}] livestream.json published: stream is now offline.`);
